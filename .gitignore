@@ -30,3 +30,13 @@
 *.exe
 *.out
 *.app
+
+/.vscode
+/build
+/test_images
+/calibrator
+/bin
+/model_weights
+/onnx
+/pt
+/engine
