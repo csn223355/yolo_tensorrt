@@ -1,3 +1,15 @@
+/**
+ * @file      calibrator.cpp
+ * @brief     
+ *
+ * Copyright (c) 2024 
+ *
+ * @author    shiningchen
+ * @date      2025.06.13
+ * @version   1.0
+*/
+
+
 #include <iostream>
 #include <fstream>
 #include <iterator>

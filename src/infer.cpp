@@ -1,3 +1,15 @@
+/**
+ * @file      infer.cpp
+ * @brief     
+ *
+ * Copyright (c) 2024 
+ *
+ * @author    shiningchen
+ * @date      2025.06.13
+ * @version   1.0
+*/
+
+
 #include <iostream>
 #include <fstream>
 
@@ -18,7 +30,7 @@ YoloDetector::YoloDetector(
         float nms_thresh,
         float conf_thresh,
         int num_class
-    ): trt_file_(trt_file), nms_thresh_(nms_thresh), conf_thresh_(conf_thresh), num_class_(num_class)
+    ): trt_file_(trt_file), nms_thresh_(nms_thresh), conf_thresh_(conf_thresh), num_class_(num_class),input_element_size(4U),output_element_size(4U)
 {
     // 设置日志级别
     g_logger = Logger(ILogger::Severity::kERROR);
@@ -32,33 +44,50 @@ YoloDetector::YoloDetector(
     getEngine();
 
     // 创建执行上下文
-    context = engine->createExecutionContext();
+    context = std::shared_ptr<nvinfer1::IExecutionContext>(engine->createExecutionContext());
 
-    // 设置输入维度
-    context->setBindingDimensions(0, Dims32 {4, {1, 3, KInputH, KInputW}});
+    // 获取输入输出张量信息
+    for(int32_t i{0}; i < engine->getNbIOTensors(); ++i){
+        auto tensor_name = engine->getIOTensorName(i);
+        Dims dim = engine->getTensorShape(tensor_name);
+        if(engine->getTensorIOMode(tensor_name) == TensorIOMode::kINPUT){
+            input_tensors[tensor_name] = dim;
+        }else{
+            output_tensors[tensor_name] = dim;
+        }
+    }
+    
+    
+    input_element_size = dataTypeToSize(engine->getTensorDataType(input_tensors.begin()->first));
+    output_element_size = dataTypeToSize(engine->getTensorDataType(output_tensors.begin()->first));
+    
+    Dims input_dims = input_tensors.begin()->second;
+    Dims out_dims = output_tensors.begin()->second;
 
-    // 获取输出维度
-    Dims32 out_dims = context->getBindingDimensions(1);  // [1, 84, 8400]
+    
 
-    // 设置输出维度
-    OUTPUT_CANDIDATES = out_dims.d[2];  // 8400
+    // 计算输入大小
+    size_t input_size{input_element_size};
+    for(int32_t i{0}; i < input_dims.nbDims; ++i){
+        input_size *= input_dims.d[i];
+    }
 
     // 计算输出大小
-    int output_size {1};  // 84 * 8400
-    for (int i {0}; i < out_dims.nbDims; i++){
+    size_t output_size{output_element_size};  // 84 * 8400
+    for (int32_t i {0}; i < out_dims.nbDims; ++i){
         output_size *= out_dims.d[i];
     }
+    output_candidates = out_dims.d[2];
 
     // 创建输出缓冲区
     output_data = new float[1 + KMaxNumOutputBbox * KNumBoxElement];
 
-    
     v_buffer_d.resize(2, nullptr);
-    CHECK(cudaMalloc(&v_buffer_d[0], 3 * KInputH * KInputW * sizeof(float)));
-    CHECK(cudaMalloc(&v_buffer_d[1], output_size * sizeof(float)));
+    CHECK(cudaMalloc(&v_buffer_d[0], input_size));
+    CHECK(cudaMalloc(&v_buffer_d[1], output_size));
 
     // 创建transpose_device和decode_device
-    CHECK(cudaMalloc(&transpose_device, output_size * sizeof(float)));
+    CHECK(cudaMalloc(&transpose_device, output_size ));
     CHECK(cudaMalloc(&decode_device, (1 + KMaxNumOutputBbox * KNumBoxElement) * sizeof(float)));
 }
 
@@ -71,68 +100,16 @@ void YoloDetector::getEngine(){
         size_t fsize = readEngine(trt_file_, engine_data);
 
         // 创建推理运行时
-        runtime = createInferRuntime(g_logger);
-        engine = runtime->deserializeCudaEngine(engine_data.data(), fsize);
+        runtime =  std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(g_logger));
+        engine = std::shared_ptr<nvinfer1::ICudaEngine>(runtime->deserializeCudaEngine(engine_data.data(), fsize));
         if (engine == nullptr) { std::cout << "Failed loading engine!" << std::endl; return; }
         std::cout << "Succeeded loading engine!" << std::endl;
 
     } else {
-
-        // TODO 用智能能指针封装下面代码成一个函数
-        IBuilder *            builder     = createInferBuilder(g_logger);
-        INetworkDefinition *  network     = builder->createNetworkV2(1U << int(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH));
-        IOptimizationProfile* profile     = builder->createOptimizationProfile();
-        IBuilderConfig *      config      = builder->createBuilderConfig();
-        config->setMaxWorkspaceSize(1 << 30);
-        IInt8Calibrator *     pCalibrator = nullptr;
-        if (FP16_MODE){
-            config->setFlag(BuilderFlag::kFP16);
+        std::cout << "Engine file not found! Use onnx to create engine!" << std::endl;
+        if(!build()){
+            std::cout << "Failed building engine!" << std::endl;
         }
-        if (INT8_MODE){
-            config->setFlag(BuilderFlag::kINT8);
-            int batchSize = 8;
-            pCalibrator = new Int8EntropyCalibrator2(batchSize, KInputW, KInputH, CalibrationDataPath.c_str(), CalibrationCacheFile.c_str());
-            config->setInt8Calibrator(pCalibrator);
-        }
-
-        nvonnxparser::IParser* parser = nvonnxparser::createParser(*network, g_logger);
-        if (!parser->parseFromFile(ONNX_MODEL_PATH.c_str(), int(g_logger.reportableSeverity))){
-            std::cout << std::string("Failed parsing .onnx file!") << std::endl;
-            for (int i {0}; i < parser->getNbErrors(); ++i){
-                auto *error = parser->getError(i);
-                std::cout << std::to_string(int(error->code())) << std::string(":") << std::string(error->desc()) << std::endl;
-            }
-            return;
-        }
-        std::cout << std::string("Succeeded parsing .onnx file!") << std::endl;
-
-        ITensor* inputTensor = network->getInput(0);
-        profile->setDimensions(inputTensor->getName(), OptProfileSelector::kMIN, Dims32 {4, {1, 3, KInputH, KInputW}});
-        profile->setDimensions(inputTensor->getName(), OptProfileSelector::kOPT, Dims32 {4, {1, 3, KInputH, KInputW}});
-        profile->setDimensions(inputTensor->getName(), OptProfileSelector::kMAX, Dims32 {4, {1, 3, KInputH, KInputW}});
-        config->addOptimizationProfile(profile);
-
-        IHostMemory *engineString = builder->buildSerializedNetwork(*network, *config);
-        std::cout << "Succeeded building serialized engine!" << std::endl;
-
-        runtime = createInferRuntime(g_logger);
-        engine = runtime->deserializeCudaEngine(engineString->data(), engineString->size());
-        if (engine == nullptr) { std::cout << "Failed building engine!" << std::endl; return; }
-        std::cout << "Succeeded building engine!" << std::endl;
-
-        if (INT8_MODE && pCalibrator != nullptr){
-            delete pCalibrator;
-        }
-
-        std::ofstream engineFile(trt_file_, std::ios::binary);
-        engineFile.write(static_cast<char *>(engineString->data()), engineString->size());
-        std::cout << "Succeeded saving .plan file!" << std::endl;
-
-        delete engineString;
-        delete parser;
-        delete config;
-        delete network;
-        delete builder;
     }
 }
 
@@ -143,16 +120,85 @@ YoloDetector::~YoloDetector(){
     for (int i{0}; i < 2; ++i)
     {
         CHECK(cudaFree(v_buffer_d[i]));
+        v_buffer_d[i] = nullptr;
     }
 
     CHECK(cudaFree(transpose_device));
+    transpose_device = nullptr;
     CHECK(cudaFree(decode_device));
+    decode_device = nullptr;
 
-    delete [] output_data;
+    if(!output_data){
+        delete [] output_data;
+        output_data = nullptr;
+    }
 
-    delete context;
-    delete engine;
-    delete runtime;
+}
+
+bool YoloDetector::build()
+{
+    auto start = std::chrono::high_resolution_clock::now();
+
+    std::unique_ptr<nvinfer1::IBuilder> builder{std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(g_logger))};
+    if(!builder) return false;
+    std::unique_ptr<nvinfer1::INetworkDefinition> network{std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(1U << static_cast<int>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH)))};
+    if(!network) return false;
+    
+    auto profile= builder->createOptimizationProfile();
+    if(!profile) return false;
+    
+    std::unique_ptr<nvinfer1::IBuilderConfig> config{std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig())};
+    if(!config) return false;
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1 << 30);
+    std::unique_ptr<nvonnxparser::IParser> parser{std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, g_logger))};
+    if(!parser) return false;
+    
+    // 量化模式
+    nvinfer1::IInt8Calibrator* p_calibrator{nullptr};
+    if (FP16_MODE){
+        config->setFlag(BuilderFlag::kFP16);
+    }
+
+    if (INT8_MODE){
+        config->setFlag(BuilderFlag::kINT8);
+        int batch_size{8};
+        p_calibrator = new Int8EntropyCalibrator2(batch_size, KInputW, KInputH, CalibrationDataPath.c_str(), CalibrationCacheFile.c_str());
+        config->setInt8Calibrator(p_calibrator);
+    }
+
+    
+    if (!parser->parseFromFile(ONNX_MODEL_PATH.c_str(), static_cast<int>(g_logger.reportableSeverity))){
+        std::cout << std::string("Failed parsing .onnx file!") << std::endl;
+        for (int i{0}; i < parser->getNbErrors(); ++i){
+            auto *error = parser->getError(i);
+            std::cout << std::to_string(static_cast<int>(error->code())) << std::string(":") << std::string(error->desc()) << std::endl;
+        }
+        return false;
+    }
+    std::cout << std::string("Succeeded parsing .onnx file!") << std::endl;
+
+    nvinfer1::ITensor* input_tensor = network->getInput(0);
+    profile->setDimensions(input_tensor->getName(), OptProfileSelector::kMIN, Dims{4, {1, 3, KInputH, KInputW}});
+    profile->setDimensions(input_tensor->getName(), OptProfileSelector::kOPT, Dims{4, {1, 3, KInputH, KInputW}});
+    profile->setDimensions(input_tensor->getName(), OptProfileSelector::kMAX, Dims{4, {1, 3, KInputH, KInputW}});
+    config->addOptimizationProfile(profile);
+
+    std::unique_ptr<nvinfer1::IHostMemory> engine_string {std::unique_ptr<nvinfer1::IHostMemory>(builder->buildSerializedNetwork(*network, *config))};
+    std::cout << "Succeeded building serialized engine!" << std::endl;
+    runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(g_logger));
+    engine = std::shared_ptr<nvinfer1::ICudaEngine>(runtime->deserializeCudaEngine(engine_string->data(), engine_string->size()));
+    if (engine == nullptr){ 
+        std::cout << "Failed building engine!" << std::endl; 
+        return false; 
+    }
+    std::cout << "Succeeded building engine!" << std::endl;
+    std::ofstream engine_file(trt_file_, std::ios::binary);
+    engine_file.write(static_cast<char *>(engine_string->data()), engine_string->size());
+    std::cout << "engine file saved path: " << trt_file_ << std::endl;
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "YoloDetector::build::Building engine done! Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+    return true;
+
 }
 
 std::vector<Detection> YoloDetector::inference(cv::Mat& img){
@@ -165,9 +211,11 @@ std::vector<Detection> YoloDetector::inference(cv::Mat& img){
     context->enqueueV2(v_buffer_d.data(), stream, nullptr);
 
     // transpose [1 84 8400] convert to [1 8400 84]
-    transpose((float*)v_buffer_d[1], transpose_device, OUTPUT_CANDIDATES, num_class_ + 4, stream);
+    transpose((float*)v_buffer_d[1], transpose_device, output_candidates, num_class_ + 4, stream);
+    
     // convert [1 8400 84] to [1 7001]
-    decode(transpose_device, decode_device, OUTPUT_CANDIDATES, num_class_, conf_thresh_, KMaxNumOutputBbox, KNumBoxElement, stream);
+    decode(transpose_device, decode_device, output_candidates, num_class_, conf_thresh_, KMaxNumOutputBbox, KNumBoxElement, stream);
+    
     // cuda nms
     nms(decode_device, nms_thresh_, KMaxNumOutputBbox, KNumBoxElement, stream);
 
@@ -184,7 +232,6 @@ std::vector<Detection> YoloDetector::inference(cv::Mat& img){
             memcpy(det.bbox, &output_data[pos], 4 * sizeof(float));
             det.conf = output_data[pos + 4];
             det.class_id = (int)output_data[pos + 5];
-            // results.push_back(det);
             results.emplace_back(det);
         }
     }
@@ -192,7 +239,6 @@ std::vector<Detection> YoloDetector::inference(cv::Mat& img){
     for (size_t j {0}; j < results.size(); j++){
         scaleBbox(img, results[j].bbox);
     }
-
     return results;
 }
 

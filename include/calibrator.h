@@ -1,5 +1,18 @@
-#ifndef __CALIBRATOR_H_
+#ifndef __CALIBRATOR_H__
 #define __CALIBRATOR_H__
+
+
+
+/**
+ * @file      calibrator.h
+ * @brief     
+ *
+ * Copyright (c) 2024 
+ *
+ * @author    shiningchen
+ * @date      2025.06.13
+ * @version   1.0
+*/
 
 #include <string>
 #include <vector>

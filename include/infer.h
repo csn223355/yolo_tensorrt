@@ -1,8 +1,21 @@
 #ifndef __INFER_H__
 #define __INFER_H__
 
-#include <opencv2/opencv.hpp>
+/**
+ * @file      infer.h
+ * @brief     
+ *
+ * Copyright (c) 2024 
+ *
+ * @author    shiningchen
+ * @date      2025.06.14
+ * @version   1.0
+*/
 
+
+#include <opencv2/opencv.hpp>
+#include <unordered_map>
+#include <memory>
 #include "public.h"
 #include "config.h"
 #include "types.h"
@@ -71,26 +84,37 @@ private:
      */
     void getEngine();
 
+    /**
+     * @brief 编译engine
+    */
+    bool build();
+
 private:
     Logger              g_logger;           /**< 日志记录器。 */
-    std::string         trt_file_;          /**< TensorRT引擎文件路径。 */
+    std::string         trt_file_;          /**< TensorRT engine文件路径。 */
 
     int                 num_class_;         /**< 类别数量。 */
     float               nms_thresh_;        /**< 非极大值抑制阈值。 */
     float               conf_thresh_;       /**< 置信度阈值。 */
+    size_t input_element_size;
+    size_t output_element_size;
+    size_t output_candidates;
 
-    ICudaEngine *       engine;             /**< TensorRT引擎。 */
-    IRuntime *          runtime;            /**< TensorRT运行时。 */
-    IExecutionContext * context;            /**< TensorRT执行上下文。 */
+    std::shared_ptr<nvinfer1::ICudaEngine> engine;    /**< TensorRT engine。 */
+    std::unique_ptr<nvinfer1::IRuntime> runtime;    /**< TensorRT运行时。 */
+    std::shared_ptr<nvinfer1::IExecutionContext> context;   /**< TensorRT执行上下文。 */        
 
     cudaStream_t        stream;             /**< CUDA流。 */
 
-    float *             output_data;        /**< 输出数据。 */
-    std::vector<void *> v_buffer_d;         /**< 设备端缓冲区。 */
-    float *             transpose_device;   /**< 转置后的设备端数据。 */
-    float *             decode_device;      /**< 解码后的设备端数据。 */
+    float*             output_data{nullptr};        /**< 输出数据。 */
+    std::vector<void*> v_buffer_d;         /**< 设备端缓冲区。 */
+    float*             transpose_device{nullptr};   /**< 转置后的设备端数据。 */
+    float*             decode_device{nullptr};      /**< 解码后的设备端数据。 */
 
-    int                 OUTPUT_CANDIDATES;  /**< 输出候选框数量，默认值为8400。 */
+    
+    std::unordered_map<const char*, Dims> input_tensors; /**< 输入tensor */
+    std::unordered_map<const char*, Dims> output_tensors; /**< 输出tensor */
+    
 };          // class YoloDetector
 
 #endif  // __INFER_H__

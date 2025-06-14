@@ -1,6 +1,18 @@
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
 
+/**
+ * @file      config.h
+ * @brief     
+ *
+ * Copyright (c) 2024 
+ *
+ * @author    shiningchen
+ * @date      2025.06.14
+ * @version   1.0
+*/
+
+
 #include <iostream>
 #include <string>
 #include <vector>
